@@ -23,16 +23,65 @@ doesn't reintroduce any of the three failure modes.
 
 ## The three root causes (shorthand)
 
-1. **HT40 vs HT20 channel width.** Some home routers set the 2.4GHz radio
-   to 40MHz channel width for extra throughput. The ESP32 Arduino WiFi
-   stack's STA association with such an AP fails repeatedly with
-   `AUTH_EXPIRE` (`WiFi.onEvent` disconnect reason `2`), even though the
-   SSID/password are correct and the network is visible in
-   `WiFi.scanNetworks()`. This is a well-known ESP32 compatibility gotcha,
-   not specific to any one router brand. Fix: `esp_wifi_set_bandwidth
-   (WIFI_IF_STA, WIFI_BW_HT20)` — must be called after `WiFi.mode(WIFI_STA)`
-   (which initializes the underlying `esp_wifi` driver) and before
-   `WiFi.begin()`.
+1. **AUTH_EXPIRE (reason 2) — most likely a router MAC lockout, not (only)
+   channel width.** This one has a real timeline worth preserving in full,
+   because the first hypothesis reached in this project turned out to be
+   incomplete, and the stale version of it is still what's written in the
+   sibling projects' own code comments and `research.md` (they were never
+   updated — this file is the corrected version; trust this over those if
+   they ever disagree).
+
+   - **2026-07-19, `usage-validation/`:** hit `WiFi.begin()` looping
+     forever with `WL_DISCONNECTED` (6), correct SSID/password, network
+     visible in scan. Router's 2.4GHz channel width happened to be set to
+     `40MHz` (HT40); switching it to `20MHz` on the router connected
+     immediately on the first try. Concluded: HT40 causes ESP32
+     `AUTH_EXPIRE` failures, a fix known elsewhere in the ESP32 community
+     too. This is a real, well-documented ESP32 compatibility issue in
+     general — the mistake was concluding it was *the* explanation for
+     every recurrence.
+   - **2026-07-20, `wifi-connect-test/`:** built specifically to
+     re-confirm the fix on a second minimal sketch, same board, same AP.
+     Before touching anything, checked the router's admin panel and
+     screenshotted it: 2.4GHz was **already** at 20MHz (`b,g,n`,
+     WPA2PSK+AES, no 802.1x) — i.e. the HT40 condition from three days
+     earlier no longer applied at all. Ran it anyway: `WiFi.onEvent` fired
+     `reason=2` (`AUTH_EXPIRE`) on every attempt, identically to the
+     earlier failure, for several retry cycles. Then, several minutes
+     later, with **zero code or router-config changes**, the very next
+     attempt connected on the first try (`status=3`).
+   - **Revised conclusion:** the channel-width fix on 2026-07-19 likely
+     worked for an unrelated reason (or coincidentally, if a lockout had
+     already expired by the time it was tried) — the failure mode itself
+     is better explained by the router's anti-flood / brute-force
+     protection temporarily blacklisting the board's MAC address
+     (`1C:DB:D4:3B:E2:88` in the observed case) after repeated rapid
+     reconnect attempts made *while debugging*, self-clearing after a
+     cooldown period. This is a hypothesis, not something confirmed via
+     router logs (consumer router admin UI didn't expose that), but it
+     fits the evidence better than channel width does: channel width was
+     already correct and the symptom persisted anyway.
+   - **What this means for the code in this repo:**
+     `esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20)` is still applied
+     in `begin()` — it's a zero-cost, well-documented fix for genuine HT40
+     cases elsewhere, no reason to remove it. But it should not be trusted
+     as *the* fix for a reason-2 failure, and the library's actual
+     defense against the lockout theory is `beginResilient()` /
+     `loopResilient()`'s **exponential backoff** (starts at
+     `retryIntervalMs`, doubles per consecutive failure up to
+     `maxRetryIntervalMs`): a fixed fast retry interval (the original
+     `usage-validation` pattern retried every 15s, forever) is exactly the
+     "hammering reconnects" behavior that plausibly extends or re-triggers
+     a lockout, so it was changed to back off instead of copying that
+     pattern as-is.
+   - **Diagnostic aside worth keeping:** disconnect reason `2`
+     (`AUTH_EXPIRE`) fires at the raw 802.11 open-system-auth stage,
+     before the PSK is ever checked — so it is categorically not a
+     wrong-password symptom. A wrong password instead fails later, at the
+     4-way handshake, with a different disconnect reason. Registering
+     `WiFi.onEvent()` to print the reason code (as `begin()` does here) is
+     the fast way to tell these apart instead of re-typing credentials to
+     rule it out.
 
 2. **Stale NVS WiFi cache.** The ESP32 WiFi driver persists connection
    state (channel, BSSID, etc.) to NVS (flash) across reboots and even
@@ -53,21 +102,25 @@ doesn't reintroduce any of the three failure modes.
    an independently-retried background concern
    (`beginResilient()`/`loopResilient()` here) rather than a setup
    precondition. `usage-validation`'s `main.cpp` was the origin of this
-   pattern (15s retry interval, non-blocking).
+   pattern (fixed 15s retry interval, non-blocking); this repo kept the
+   non-blocking shape but changed the fixed interval to backoff, per #1.
 
 ## API surface (`lib/Esp32WifiFix/Esp32WifiFix.h`)
 
-- `begin()` — call once, applies fixes #1 and #2. Must run before either
-  `connect()` or `beginResilient()`.
+- `begin()` — call once, applies fixes #1 (defensively) and #2. Must run
+  before either `connect()` or `beginResilient()`.
 - `connect(ssid, password, timeoutMs=30000)` — blocking, fix #3 not
   applied (by design — this is the "I want it simple and my sketch has
   nothing else to do" path). Prints a scan + status trace; on timeout,
   prints a checklist instead of just returning false silently.
-- `beginResilient(ssid, password, retryIntervalMs=15000)` +
-  `loopResilient()` — non-blocking pair implementing fix #3.
+- `beginResilient(ssid, password, retryIntervalMs=15000, maxRetryIntervalMs=120000)`
+  + `loopResilient()` — non-blocking pair implementing fix #3.
   `loopResilient()` must be called every `loop()` iteration; it returns
   `true` exactly once, on the edge where the connection comes up (useful
   for triggering one-time post-connect work like an initial data poll).
+  Retry interval doubles on each consecutive failure, capped at
+  `maxRetryIntervalMs`, and resets to `retryIntervalMs` on the next
+  successful connect.
 - `statusName(wl_status_t)` / `scanAndPrint()` — static diagnostic helpers,
   used internally by `connect()` but also public for use in custom
   reconnect logic.
@@ -79,13 +132,15 @@ doesn't reintroduce any of the three failure modes.
   (`WiFi.mode` → `WiFi.onEvent` → `WiFi.disconnect(true,true)` → delay(200)
   → `esp_wifi_set_bandwidth`) matters and shouldn't be reordered casually.
   This exact sequence is what was confirmed working on real hardware in
-  `wifi-connect-test`.
-- The HT40 issue is a **router-side** setting, not fixable from firmware
-  alone in the general case — forcing `WIFI_BW_HT20` on the ESP32 side
-  works because it makes the ESP32 negotiate 20MHz regardless of what the
-  router advertises, but if a given AP absolutely requires 40MHz-only
-  (rare), this workaround won't help. Wasn't hit in practice; noting the
-  theoretical edge.
+  `wifi-connect-test`, independent of whether HT20 itself was the actual
+  fix for any given failure (see #1).
+- **`research.md` and `wifi-connect-test/src/main.cpp`'s code comment in
+  the sibling `claude-desktop-buddy` repo still state the original,
+  superseded HT40-only explanation as settled fact** — they were written
+  on 2026-07-19 and never updated after the 2026-07-20 re-test falsified
+  the "channel width alone explains it" reading. If those files and this
+  one ever seem to disagree, this file (and the auto-memory project note
+  it was extracted from) has the corrected account.
 - ESP32-C3 SuperMini clones need `-DARDUINO_USB_MODE=1
   -DARDUINO_USB_CDC_ON_BOOT=1` (already in this repo's `platformio.ini`) or
   they won't enumerate a usable serial port at all — easy to misdiagnose

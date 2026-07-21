@@ -8,14 +8,19 @@ fixes into one reusable library instead of re-solving them a fourth time.
 
 ## Problems this fixes
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| `WiFi.begin()` loops forever, `WiFi.status()` stuck at `WL_DISCONNECTED` (6) — even though the SSID is correct and shows up in `WiFi.scanNetworks()` | Router's 2.4GHz radio is broadcasting at 40MHz channel width (HT40). The ESP32 STA repeatedly fails association with `AUTH_EXPIRE` (disconnect reason 2). | Force 20MHz before connecting: `esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20)` |
+| `WiFi.begin()` loops forever, stuck at `WL_DISCONNECTED` (6) with disconnect reason `2` (`AUTH_EXPIRE`) on every attempt — even though the SSID/password are correct and the network shows up in `WiFi.scanNetworks()` | Most likely a **router-side anti-flood block temporarily blacklisting the board's MAC address** after repeated rapid reconnect attempts (self-clears after a cooldown, no code/config change needed). A 2.4GHz-set-to-40MHz-channel-width (HT40) router setting is commonly cited elsewhere for this same symptom, but in our own re-test the router was already confirmed at 20MHz via its admin panel and the failure still happened identically — so treat HT40 as a secondary suspect, not a confirmed cause. Full timeline in [readai.md](readai.md). | `esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20)` is applied defensively (cheap, and a documented fix for the HT40 case elsewhere) — but the fix that actually matters is **not hammering reconnects**: `loopResilient()` backs off exponentially instead of retrying on a fixed fast interval, so it can't re-trigger or extend a MAC lockout. |
 | Auth intermittently fails after reflashing the same board with different firmware/credentials | The previous firmware's WiFi state (old channel/BSSID) is still cached in NVS and interferes with the new association | `WiFi.disconnect(true, true)` (erases the saved config, not just a disconnect) before every `WiFi.begin()` |
-| Firmware hangs forever in `setup()` if WiFi never connects — blocks unrelated peripherals (LCD, web server) that don't even need WiFi | A blocking `while (WiFi.status() != WL_CONNECTED) {}` loop with no escape | Non-blocking connect: start everything else regardless, retry WiFi from `loop()` on an interval |
+| Firmware hangs forever in `setup()` if WiFi never connects — blocks unrelated peripherals (LCD, web server) that don't even need WiFi | A blocking `while (WiFi.status() != WL_CONNECTED) {}` loop with no escape | Non-blocking connect: start everything else regardless, retry WiFi from `loop()` with backoff |
 
-Full debugging narrative (symptoms, dead ends, the router setting that
-actually fixed it) is in [readai.md](readai.md).
+> **Diagnostic tip:** disconnect reason `2` (`AUTH_EXPIRE`) fires at the raw 802.11
+> open-system-auth stage, *before* the PSK is ever checked — so it's never a
+> wrong-password problem. A bad password instead fails later, at the 4-way handshake.
+> Don't waste time re-typing credentials for a reason-2 failure.
+
+Full debugging narrative (symptoms, dead ends, what evidence ruled out the
+channel-width theory) is in [readai.md](readai.md).
 
 ## Usage
 
