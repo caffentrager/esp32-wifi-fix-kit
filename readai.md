@@ -50,30 +50,77 @@ doesn't reintroduce any of the three failure modes.
      earlier failure, for several retry cycles. Then, several minutes
      later, with **zero code or router-config changes**, the very next
      attempt connected on the first try (`status=3`).
-   - **Revised conclusion:** the channel-width fix on 2026-07-19 likely
-     worked for an unrelated reason (or coincidentally, if a lockout had
-     already expired by the time it was tried) — the failure mode itself
-     is better explained by the router's anti-flood / brute-force
-     protection temporarily blacklisting the board's MAC address
-     (`1C:DB:D4:3B:E2:88` in the observed case) after repeated rapid
-     reconnect attempts made *while debugging*, self-clearing after a
-     cooldown period. This is a hypothesis, not something confirmed via
-     router logs (consumer router admin UI didn't expose that), but it
-     fits the evidence better than channel width does: channel width was
-     already correct and the symptom persisted anyway.
+   - **Revised conclusion (2026-07-20, superseded below):** the
+     channel-width fix on 2026-07-19 likely worked for an unrelated reason
+     (or coincidentally, if a lockout had already expired by the time it
+     was tried) — the failure mode itself is better explained by the
+     router's anti-flood / brute-force protection temporarily blacklisting
+     the board's MAC address (`1C:DB:D4:3B:E2:88` in the observed case)
+     after repeated rapid reconnect attempts made *while debugging*,
+     self-clearing after a cooldown period. This is a hypothesis, not
+     something confirmed via router logs (consumer router admin UI didn't
+     expose that), but it fits the evidence better than channel width
+     does: channel width was already correct and the symptom persisted
+     anyway.
+   - **2026-07-21, separate `ClaudeMeterLCD` project, same board class:**
+     hit identical `reason=2` again, but this time reproduced across
+     **three unrelated APs** (home router, a fresh guest-network SSID on
+     that same router, and an unrelated Windows Mobile Hotspot on a
+     different PC entirely) and **two different physical boards** — a
+     100% failure rate, every combination, no exceptions. That rules out
+     both "this one router" and "this one board" as the cause; a
+     router-side MAC lockout can't explain failing identically against a
+     hotspot that never saw this MAC address before. Neither
+     `esp_wifi_set_bandwidth(HT20)` nor `WiFi.setTxPower(WIFI_POWER_19_5dBm)`
+     (max) nor leaving TX power at its 19.5dBm default changed anything.
+     Root cause found via
+     [arduino-esp32 #6767](https://github.com/espressif/arduino-esp32/issues/6767):
+     several ESP32-C3 SuperMini/clone boards have a genuine **RF hardware
+     defect** — antenna impedance matching is off, reflecting the default
+     19.5dBm TX power back into the radio and corrupting the auth
+     exchange. Jason2866 (Tasmota) physically modified the antenna
+     matching network on affected units and confirmed this by hand:
+     *"The antenna matching is not correct. So the HF signal gets
+     reflected... Arduino core is NOT the problem!"* Community-verified
+     workaround (same issue, credited to `Sys64736`):
+     `WiFi.setTxPower(WIFI_POWER_8_5dBm)` called **immediately after**
+     `WiFi.begin()` — not before; the STA interface isn't up yet before
+     `begin()` returns, so setting TX power earlier is a silent no-op
+     (this is *why* the 2026-07-21 max-power and default-power tests
+     above didn't move the needle — the timing was wrong on both, not
+     just the direction). Verified fixed on real hardware: first attempt
+     succeeded on a board+network combination that had failed 100% of the
+     time until then. Reducing TX power is explicitly described upstream
+     as a workaround, not a repair — it shrinks effective range (reports
+     of solid connectivity dropping off past ~10m) rather than fixing the
+     antenna mismatch itself, which needs a hardware rework to actually
+     resolve.
+   - **Revised conclusion (2026-07-21, current):** the MAC-lockout theory
+     above was a reasonable read of the evidence available at the time —
+     recovery with zero code/config changes really does look like a
+     cooldown expiring. It doesn't survive the harder evidence gathered
+     later, though: the same board reproducing `reason=2` against APs
+     that have never seen its MAC address before (a brand-new guest SSID,
+     an unrelated PC's hotspot) isn't explainable by any single router's
+     anti-flood policy. The board-side antenna defect explains both
+     observed patterns at once — an affected board fails consistently
+     against *everything* until TX power is lowered; a board with a
+     milder case of the same defect is the one that looks "intermittent"
+     as RF margins shift with temperature/positioning. **If you're
+     debugging a fresh `reason=2` report, check `WIFI_POWER_8_5dBm` first,
+     before spending time on router settings.**
    - **What this means for the code in this repo:**
      `esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20)` is still applied
      in `begin()` — it's a zero-cost, well-documented fix for genuine HT40
-     cases elsewhere, no reason to remove it. But it should not be trusted
-     as *the* fix for a reason-2 failure, and the library's actual
-     defense against the lockout theory is `beginResilient()` /
-     `loopResilient()`'s **exponential backoff** (starts at
-     `retryIntervalMs`, doubles per consecutive failure up to
-     `maxRetryIntervalMs`): a fixed fast retry interval (the original
-     `usage-validation` pattern retried every 15s, forever) is exactly the
-     "hammering reconnects" behavior that plausibly extends or re-triggers
-     a lockout, so it was changed to back off instead of copying that
-     pattern as-is.
+     cases elsewhere, no reason to remove it. It is not, however, the fix
+     for the antenna-defect class of `reason=2` above — that fix is now in
+     `connect()` and `beginResilient()`/`loopResilient()`, right after
+     every `WiFi.begin()` call:
+     `WiFi.setTxPower(WIFI_POWER_8_5dBm)`. Exponential backoff is kept too
+     (still generally good practice, and does help if a router-side
+     lockout is ever the real cause on some other board/network), but on
+     the antenna-defect class of hardware, no amount of backoff gets you
+     connected without the TX-power fix.
    - **Diagnostic aside worth keeping:** disconnect reason `2`
      (`AUTH_EXPIRE`) fires at the raw 802.11 open-system-auth stage,
      before the PSK is ever checked — so it is categorically not a
@@ -82,6 +129,15 @@ doesn't reintroduce any of the three failure modes.
      `WiFi.onEvent()` to print the reason code (as `begin()` does here) is
      the fast way to tell these apart instead of re-typing credentials to
      rule it out.
+   - **Second diagnostic aside (2026-07-21):** `WiFi.status()` returning
+     `WL_NO_SSID_AVAIL` instead of `WL_DISCONNECTED` is a different signal
+     worth not confusing with the above — it means the board's scan never
+     saw the SSID at all (usually a 2.4GHz/5GHz band mismatch; several
+     modern phone hotspots and Windows Mobile Hotspot both default to
+     5GHz or "auto" and need to be forced to 2.4GHz-only, since ESP32
+     doesn't do 5GHz at all) rather than seeing the network and failing
+     auth against it. `statusName()` in this library already surfaces
+     this distinction if you print/display it.
 
 2. **Stale NVS WiFi cache.** The ESP32 WiFi driver persists connection
    state (channel, BSSID, etc.) to NVS (flash) across reboots and even
@@ -112,7 +168,9 @@ doesn't reintroduce any of the three failure modes.
 - `connect(ssid, password, timeoutMs=30000)` — blocking, fix #3 not
   applied (by design — this is the "I want it simple and my sketch has
   nothing else to do" path). Prints a scan + status trace; on timeout,
-  prints a checklist instead of just returning false silently.
+  prints a checklist instead of just returning false silently. Also
+  applies the TX-power antenna-defect workaround from #1
+  (`WiFi.setTxPower(WIFI_POWER_8_5dBm)`, right after `WiFi.begin()`).
 - `beginResilient(ssid, password, retryIntervalMs=15000, maxRetryIntervalMs=120000)`
   + `loopResilient()` — non-blocking pair implementing fix #3.
   `loopResilient()` must be called every `loop()` iteration; it returns
@@ -120,13 +178,22 @@ doesn't reintroduce any of the three failure modes.
   for triggering one-time post-connect work like an initial data poll).
   Retry interval doubles on each consecutive failure, capped at
   `maxRetryIntervalMs`, and resets to `retryIntervalMs` on the next
-  successful connect.
+  successful connect. Applies the same TX-power fix after every
+  `WiFi.begin()` call, including retries from `loopResilient()`.
 - `statusName(wl_status_t)` / `scanAndPrint()` — static diagnostic helpers,
   used internally by `connect()` but also public for use in custom
   reconnect logic.
 
 ## Gotchas not obvious from the code
 
+- **`WiFi.setTxPower()` must be called AFTER `WiFi.begin()`, not before.**
+  Calling it earlier (e.g. in `begin()` alongside the bandwidth/NVS fixes)
+  is a silent no-op — the STA interface isn't up yet, so nothing errors,
+  it just doesn't take effect, and you'll burn time thinking the fix
+  "didn't work" when really it was never applied. This is exactly what
+  happened during the 2026-07-21 debugging session (see #1): TX power
+  was tested in both directions before this ordering bug was found, and
+  neither direction did anything until the call moved to after `begin()`.
 - `esp_wifi_set_bandwidth` silently no-ops (or can crash) if called before
   `esp_wifi` is initialized — that's why `begin()`'s internal ordering
   (`WiFi.mode` → `WiFi.onEvent` → `WiFi.disconnect(true,true)` → delay(200)
